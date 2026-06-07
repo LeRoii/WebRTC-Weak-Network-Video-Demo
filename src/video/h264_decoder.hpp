@@ -17,9 +17,13 @@ public:
     H264Decoder(const H264Decoder &) = delete;
     H264Decoder &operator=(const H264Decoder &) = delete;
 
-    void decode(const std::byte *data, std::size_t size);
+    bool decode(const std::byte *data, std::size_t size);
+    void reset();
 
 private:
+    void open();
+    void close();
+
     VideoRenderer &renderer_;
     AVCodecContext *context_ = nullptr;
     AVFrame *frame_ = nullptr;

@@ -20,7 +20,9 @@ public:
                   Endpoint local,
                   Endpoint peer,
                   std::string video_file,
-                  std::string output_file);
+                  std::string output_file,
+                  int max_video_kbps,
+                  int recovery_timeout_ms);
     ~WebRtcSession();
 
     void run();
@@ -34,7 +36,8 @@ private:
     void stats_loop();
 
     static void print_sender_quality(const NetworkQuality &quality,
-                                     const VideoProfile &video);
+                                     const VideoProfile &video,
+                                     const VideoTransportStats &transport);
     static void print_receiver_video_stats(const VideoReceiveStatsSnapshot &stats);
 
     Role role_;

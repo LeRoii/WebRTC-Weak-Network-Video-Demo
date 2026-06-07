@@ -24,8 +24,21 @@ struct NetworkQuality {
 };
 
 struct VideoProfile {
-    int bitrate_kbps = 2500;
+    int level = 0;
+    int bitrate_kbps = 2000;
     int fps = 30;
     int width = 1280;
     int height = 720;
+
+    bool operator==(const VideoProfile &other) const {
+        return level == other.level &&
+               bitrate_kbps == other.bitrate_kbps &&
+               fps == other.fps &&
+               width == other.width &&
+               height == other.height;
+    }
+
+    bool operator!=(const VideoProfile &other) const {
+        return !(*this == other);
+    }
 };

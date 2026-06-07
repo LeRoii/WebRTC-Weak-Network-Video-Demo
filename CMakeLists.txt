@@ -30,6 +30,7 @@ add_executable(webrtc_net_quality_probe
     src/video/video_renderer.cpp
     src/video/video_sender.cpp
     src/video/video_stats.cpp
+    src/video/video_transport_handler.cpp
     src/webrtc/webrtc_session.cpp
 )
 

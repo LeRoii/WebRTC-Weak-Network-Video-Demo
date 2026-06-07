@@ -14,10 +14,34 @@ void VideoReceiveStats::on_encoded_frame(std::size_t bytes) {
     }
 }
 
+void VideoReceiveStats::on_decoder_error() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++decoder_errors_;
+}
+
+void VideoReceiveStats::set_transport(uint64_t dropped_frames,
+                                      uint64_t nack_packets,
+                                      uint64_t retransmitted_packets,
+                                      uint64_t pli_packets,
+                                      bool synchronized) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    dropped_frames_ = dropped_frames;
+    nack_packets_ = nack_packets;
+    retransmitted_packets_ = retransmitted_packets;
+    pli_packets_ = pli_packets;
+    synchronized_ = synchronized;
+}
+
 VideoReceiveStatsSnapshot VideoReceiveStats::snapshot() const {
     std::lock_guard<std::mutex> lock(mutex_);
     VideoReceiveStatsSnapshot result;
     result.frames = frames_;
+    result.dropped_frames = dropped_frames_;
+    result.nack_packets = nack_packets_;
+    result.retransmitted_packets = retransmitted_packets_;
+    result.pli_packets = pli_packets_;
+    result.decoder_errors = decoder_errors_;
+    result.synchronized = synchronized_;
 
     if (bytes_window_.size() >= 2) {
         std::size_t bytes = 0;

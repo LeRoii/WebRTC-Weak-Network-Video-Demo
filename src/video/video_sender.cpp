@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <iostream>
 #include <rtc/h264rtppacketizer.hpp>
+#include <rtc/pacinghandler.hpp>
 #include <rtc/rtcpnackresponder.hpp>
 #include <rtc/rtcpsrreporter.hpp>
 #include <rtc/rtppacketizationconfig.hpp>
@@ -31,7 +32,7 @@ void VideoSender::set_track(std::shared_ptr<rtc::Track> track) {
 
     constexpr int kPayloadType = 102;
     constexpr int kClockRate = 90000;
-    constexpr uint16_t kMaxFragmentSize = 1200;
+    constexpr uint16_t kMaxFragmentSize = 1100;
 
     auto rtp_config =
         std::make_shared<rtc::RtpPacketizationConfig>(ssrc_, "video-stream",
@@ -45,26 +46,70 @@ void VideoSender::set_track(std::shared_ptr<rtc::Track> track) {
                                    *estimator_, MediaStatisticsHandler::Direction::Sender)
                              : nullptr;
     auto sr_reporter = std::make_shared<rtc::RtcpSrReporter>(rtp_config);
-    auto nack_responder = std::make_shared<rtc::RtcpNackResponder>();
+    auto transport_handler =
+        std::make_shared<VideoTransportHandler>(
+            VideoTransportHandler::Direction::Sender);
+    auto pacing_handler = std::make_shared<rtc::PacingHandler>(
+        2'300'000.0, std::chrono::milliseconds(5), 8U * 1024U * 1024U);
+    auto nack_responder =
+        std::make_shared<rtc::RtcpNackResponder>(4096);
+
+    transport_handler->on_keyframe_requested([this]() {
+        recovery_mode_.store(true);
+        force_keyframe_.store(true);
+    });
+    transport_handler->on_keyframe_acknowledged([this]() {
+        recovery_mode_.store(false);
+    });
 
     if (stats_handler) {
         packetizer->addToChain(stats_handler);
     }
+    packetizer->addToChain(transport_handler);
     packetizer->addToChain(sr_reporter);
     packetizer->addToChain(nack_responder);
+    packetizer->addToChain(pacing_handler);
     track->setMediaHandler(packetizer);
 
     std::lock_guard<std::mutex> lock(mutex_);
     track_ = std::move(track);
     media_handler_ = std::move(packetizer);
     stats_handler_ = std::move(stats_handler);
+    transport_handler_ = std::move(transport_handler);
     sr_reporter_ = std::move(sr_reporter);
     nack_responder_ = std::move(nack_responder);
+    pacing_handler_ = std::move(pacing_handler);
 }
 
 void VideoSender::update_profile(VideoProfile profile) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (profile_ != profile) {
+        force_keyframe_.store(true);
+    }
     profile_ = profile;
+}
+
+void VideoSender::update_network_quality(NetworkQuality quality) {
+    std::shared_ptr<rtc::PacingHandler> pacing;
+    VideoProfile profile;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        quality_ = quality;
+        pacing = pacing_handler_;
+        profile = profile_;
+    }
+    if (!pacing) {
+        return;
+    }
+    const double loss =
+        std::max(quality.loss_percent, quality.transport_loss_percent);
+    const double survival = std::max(0.20, 1.0 - loss / 100.0);
+    const double pacing_bps = std::clamp(
+        static_cast<double>(profile.bitrate_kbps) * 1000.0 *
+            1.15 / survival,
+        static_cast<double>(profile.bitrate_kbps) * 1150.0,
+        8'000'000.0);
+    pacing->setBitrate(pacing_bps);
 }
 
 void VideoSender::set_video_file(std::string path) {
@@ -100,6 +145,17 @@ void VideoSender::send_loop() {
             continue;
         }
 
+        const int64_t at_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        if (recovery_mode_.load() &&
+            last_recovery_frame_us_ != 0 &&
+            at_us - last_recovery_frame_us_ < 250'000) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+
         EncodedVideoFrame frame;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -109,14 +165,26 @@ void VideoSender::send_loop() {
                 break;
             }
 
-            if (!file_reader_->next_frame(frame)) {
+            const bool force_keyframe =
+                force_keyframe_.exchange(false) || recovery_mode_.load();
+            if (!file_reader_->next_frame(frame, profile, force_keyframe)) {
                 file_reader_->reset();
+                force_keyframe_.store(true);
                 continue;
             }
         }
 
+        std::shared_ptr<VideoTransportHandler> transport;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            transport = transport_handler_;
+        }
+        if (transport) {
+            transport->set_outgoing_frame(frame.epoch, frame.keyframe);
+        }
+
         const std::size_t frame_bytes = frame.data.size();
-        if (!send_frame(std::move(frame.data), timestamp_)) {
+        if (!send_frame(std::move(frame.data), timestamp_, frame.keyframe)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
@@ -129,6 +197,9 @@ void VideoSender::send_loop() {
         }
 
         ++frame_index_;
+        if (recovery_mode_.load()) {
+            last_recovery_frame_us_ = at_us;
+        }
         timestamp_ += frame.duration_90khz;
         const auto frame_interval =
             std::chrono::microseconds(frame.duration_90khz * 1'000'000ULL / 90000);
@@ -136,7 +207,9 @@ void VideoSender::send_loop() {
     }
 }
 
-bool VideoSender::send_frame(rtc::binary frame, uint32_t timestamp) {
+bool VideoSender::send_frame(rtc::binary frame,
+                             uint32_t timestamp,
+                             bool keyframe) {
     std::shared_ptr<rtc::Track> track;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -149,10 +222,20 @@ bool VideoSender::send_frame(rtc::binary frame, uint32_t timestamp) {
 
     try {
         rtc::FrameInfo info(timestamp);
+        info.isKeyFrame = keyframe;
         track->sendFrame(std::move(frame), info);
         return true;
     } catch (const std::exception &error) {
         std::cerr << "video_send_failed=" << error.what() << std::endl;
         return false;
     }
+}
+
+VideoTransportStats VideoSender::transport_snapshot() const {
+    std::shared_ptr<VideoTransportHandler> transport;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        transport = transport_handler_;
+    }
+    return transport ? transport->snapshot() : VideoTransportStats{};
 }
