@@ -37,13 +37,17 @@ bool contains_h264_idr(const rtc::binary &frame) {
 }
 }
 
-VideoReceiver::VideoReceiver() : decoder_(renderer_) {}
+VideoReceiver::VideoReceiver() : decoder_(renderer_) {
+    decoder_.set_frame_callback(
+        [this](const AVFrame *frame) { demo_recorder_.submit(frame); });
+}
 
 VideoReceiver::~VideoReceiver() {
     stopping_.store(true);
     if (recovery_thread_.joinable()) {
         recovery_thread_.join();
     }
+    demo_recorder_.stop();
     renderer_.stop();
 }
 
@@ -56,6 +60,12 @@ void VideoReceiver::set_output_file(const std::string &path) {
     output_.open(path, std::ios::binary | std::ios::trunc);
     if (!output_) {
         throw std::runtime_error("cannot open receiver output file: " + path);
+    }
+}
+
+void VideoReceiver::set_demo_record_file(const std::string &path) {
+    if (!path.empty()) {
+        demo_recorder_.start(path);
     }
 }
 

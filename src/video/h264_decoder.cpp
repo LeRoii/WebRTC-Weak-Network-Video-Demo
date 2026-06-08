@@ -73,10 +73,18 @@ bool H264Decoder::decode(const std::byte *data, std::size_t size) {
             (frame_->flags & AV_FRAME_FLAG_CORRUPT) != 0 ||
             frame_->decode_error_flags != 0;
         if (!corrupt) {
+            if (frame_callback_) {
+                frame_callback_(frame_);
+            }
             renderer_.submit(frame_);
             rendered = true;
         }
         av_frame_unref(frame_);
     }
     return rendered;
+}
+
+void H264Decoder::set_frame_callback(
+    std::function<void(const AVFrame *)> callback) {
+    frame_callback_ = std::move(callback);
 }

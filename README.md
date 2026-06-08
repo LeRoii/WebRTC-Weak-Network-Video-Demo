@@ -171,6 +171,54 @@ frames:
 ffmpeg -v error -err_detect explode -i /tmp/received.h264 -f null -
 ```
 
+## Generate the presentation video
+
+The optional demo workflow records the receiver at a constant `1280x720`,
+30 fps. Lower-resolution received frames remain at their native pixel size and
+are centered on a black canvas. When the adaptive profile drops below 30 fps,
+the recorder holds the latest decoded frame instead of generating interpolated
+motion.
+
+Generate the English-language presentation video with:
+
+```bash
+./demo/make_demo.py
+```
+
+The script builds the project, creates the network namespaces, waits for media
+to start, and runs this sequence:
+
+```text
+0% loss for 10 seconds
+30% loss for 15 seconds
+50% loss for 20 seconds
+0% loss for 20 seconds (network recovery)
+```
+
+It combines the real receiver recording, the source preview, and timestamped
+runtime metrics into:
+
+```text
+demo/output/weak_network_demo_720p30.mp4
+```
+
+Omit the source preview while keeping the receiver video and dashboard:
+
+```bash
+./demo/make_demo.py \
+  --no-source-preview \
+  --output demo/output/weak_network_demo_no_source_720p30.mp4
+```
+
+For a short workflow check, override the four stage durations:
+
+```bash
+./demo/make_demo.py --durations 3,3,3,3
+```
+
+The receiver window uses the active X11 or Wayland desktop session when one is
+available. Use `--headless` for unattended generation without a live window.
+
 The receiver requires access to the graphical desktop. When running it through
 `sudo ip netns exec`, preserve the desktop environment variables required by
 your X11 or Wayland session. For headless validation, set

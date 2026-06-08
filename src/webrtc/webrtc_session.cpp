@@ -28,6 +28,7 @@ WebRtcSession::WebRtcSession(Role role,
                              Endpoint peer,
                              std::string video_file,
                              std::string output_file,
+                             std::string demo_record_file,
                              int max_video_kbps,
                              int recovery_timeout_ms)
     : role_(role),
@@ -50,6 +51,7 @@ WebRtcSession::WebRtcSession(Role role,
         video_receiver_.set_recovery_timeout_ms(recovery_timeout_ms);
         video_receiver_.start_display();
         video_receiver_.set_output_file(output_file);
+        video_receiver_.set_demo_record_file(demo_record_file);
     }
 
     configure_video();
