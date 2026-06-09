@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import csv
 import json
 import os
 import pwd
@@ -26,7 +27,9 @@ SENDER_RE = re.compile(
     r"(?P<width>\d+)x(?P<height>\d+)"
 )
 RECEIVER_RE = re.compile(r"sync=(?P<sync>[01])")
-RECORDER_STARTED_RE = re.compile(r"demo_recording_started=")
+RECORDER_STARTED_RE = re.compile(
+    r"demo_recording_started=.* start_us=(?P<start_us>\d+)"
+)
 
 
 class DemoRun:
@@ -35,9 +38,16 @@ class DemoRun:
         self.output = args.output.resolve()
         self.work = self.output.parent / "work"
         self.raw_recording = self.work / "receiver_720p30.mp4"
+        self.source_recording = self.work / "source_720p30.mp4"
         self.received_h264 = self.work / "received.h264"
         self.ass_file = self.work / "dashboard.ass"
         self.timeline_file = self.work / "timeline.json"
+        self.latency_csv = self.output.with_name(
+            self.output.stem + "_latency.csv"
+        )
+        self.latency_summary_file = self.output.with_name(
+            self.output.stem + "_latency_summary.json"
+        )
         self.log_file = self.work / "run.log"
         self.processes = []
         self.reader_threads = []
@@ -45,6 +55,8 @@ class DemoRun:
         self.events = []
         self.demo_started = threading.Event()
         self.demo_start_time = None
+        self.recording_start_us = None
+        self.source_recording_start_us = None
         self.namespaces_created = False
 
     def run(self):
@@ -60,7 +72,9 @@ class DemoRun:
             self.finish_readers()
 
         self.validate_raw_recording()
+        self.validate_latency_csv()
         self.write_timeline()
+        self.write_latency_summary()
         self.write_ass()
         self.compose()
         self.validate_final_video()
@@ -134,6 +148,8 @@ class DemoRun:
             str(self.received_h264),
             "--demo-record-file",
             str(self.raw_recording),
+            "--latency-csv",
+            str(self.latency_csv),
         ]
         sender = namespace_user_prefix("webrtc_tx") + [
             str(binary),
@@ -146,6 +162,11 @@ class DemoRun:
             "--video-file",
             str(self.args.input.resolve()),
         ]
+        if not self.args.no_source_preview:
+            sender += [
+                "--demo-source-record-file",
+                str(self.source_recording),
+            ]
         self.processes.append(("receiver", self.start_process(receiver)))
         time.sleep(0.5)
         self.processes.append(("sender", self.start_process(sender)))
@@ -174,10 +195,15 @@ class DemoRun:
             for raw_line in process.stdout:
                 line = raw_line.rstrip()
                 now = time.monotonic()
-                if name == "receiver" and RECORDER_STARTED_RE.search(line):
+                recorder_started = RECORDER_STARTED_RE.search(line)
+                if recorder_started:
                     with self.log_lock:
-                        if self.demo_start_time is None:
+                        start_us = int(recorder_started.group("start_us"))
+                        if name == "sender":
+                            self.source_recording_start_us = start_us
+                        elif self.demo_start_time is None:
                             self.demo_start_time = now
+                            self.recording_start_us = start_us
                             self.demo_started.set()
                 with self.log_lock:
                     at = (
@@ -296,6 +322,29 @@ class DemoRun:
         probe = probe_video(self.raw_recording)
         assert_video_shape(probe, self.raw_recording)
         assert_constant_frame_rate(self.raw_recording)
+        if not self.args.no_source_preview:
+            if (not self.source_recording.is_file() or
+                    self.source_recording.stat().st_size == 0):
+                raise RuntimeError("sender source recording was not created")
+            source_probe = probe_video(self.source_recording)
+            assert_video_shape(source_probe, self.source_recording)
+            assert_constant_frame_rate(self.source_recording)
+            if self.source_recording_start_us is None:
+                raise RuntimeError(
+                    "sender source recording start timestamp is unavailable"
+                )
+
+    def validate_latency_csv(self):
+        samples = self.load_latency_samples()
+        if not samples:
+            raise RuntimeError("latency CSV contains no presented frames")
+        frame_keys = [(sample["epoch"], sample["frame_id"]) for sample in samples]
+        if len(frame_keys) != len(set(frame_keys)):
+            raise RuntimeError("latency CSV contains duplicate presented frames")
+        if any(sample["latency_ms"] < 0 for sample in samples):
+            raise RuntimeError("latency CSV contains negative latency")
+        if self.recording_start_us is None:
+            raise RuntimeError("demo recording start timestamp is unavailable")
 
     def write_timeline(self):
         with self.log_lock:
@@ -305,8 +354,69 @@ class DemoRun:
             encoding="utf-8",
         )
 
+    def load_latency_samples(self):
+        if not self.latency_csv.is_file():
+            return []
+        samples = []
+        with self.latency_csv.open(newline="", encoding="utf-8") as source:
+            for row in csv.DictReader(source):
+                if row["status"] != "presented" or not row["source_to_present_ms"]:
+                    continue
+                present_us = int(row["present_us"])
+                video_at = (
+                    (present_us - self.recording_start_us) / 1_000_000.0
+                    if self.recording_start_us is not None
+                    else 0.0
+                )
+                samples.append(
+                    {
+                        "at": max(0.0, video_at),
+                        "epoch": int(row["epoch"]),
+                        "frame_id": int(row["frame_id"]),
+                        "latency_ms": float(row["source_to_present_ms"]),
+                    }
+                )
+        samples.sort(key=lambda sample: (sample["at"], sample["frame_id"]))
+        return samples
+
+    def target_duration(self):
+        return min(
+            probe_duration(self.raw_recording),
+            sum(self.args.durations),
+        )
+
+    def write_latency_summary(self):
+        duration = self.target_duration()
+        samples = [
+            sample
+            for sample in self.load_latency_samples()
+            if sample["at"] <= duration
+        ]
+        values = sorted(sample["latency_ms"] for sample in samples)
+        summary = {
+            "presented_frames": len(values),
+            "p50_ms": percentile(values, 50),
+            "p95_ms": percentile(values, 95),
+            "max_ms": max(values),
+        }
+        self.latency_summary_file.write_text(
+            json.dumps(summary, indent=2) + "\n", encoding="utf-8"
+        )
+        print(
+            "E2E display latency: "
+            f"P50={summary['p50_ms']:.3f} ms "
+            f"P95={summary['p95_ms']:.3f} ms "
+            f"max={summary['max_ms']:.3f} ms "
+            f"frames={summary['presented_frames']}"
+        )
+
     def write_ass(self):
-        duration = probe_duration(self.raw_recording)
+        duration = self.target_duration()
+        latency_samples = [
+            sample
+            for sample in self.load_latency_samples()
+            if sample["at"] <= duration
+        ]
         sender_samples = []
         receiver_samples = []
         stages = []
@@ -360,8 +470,16 @@ Style: Banner,Noto Sans,42,&H00FFFFFF,&H00FFFFFF,&H00101010,&H50000000,1,0,0,0,1
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
         lines = [header]
-        for second in range(max(1, int(duration + 0.999))):
-            at = min(second + 0.5, duration)
+        for index, latency in enumerate(latency_samples):
+            start = min(latency["at"], duration)
+            end = (
+                min(latency_samples[index + 1]["at"], duration)
+                if index + 1 < len(latency_samples)
+                else duration
+            )
+            if end <= start:
+                continue
+            at = min(start + 0.001, duration)
             stage = latest_at(stages, at) or {
                 "label": "NORMAL NETWORK",
                 "loss": 0,
@@ -392,10 +510,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 f"Injected Packet Loss: {stage['loss']}%\\N"
                 f"Measured Transport Loss (5s avg): {measured}\\N"
                 f"Video Profile: {profile}\\N"
-                f"Sync Status: {sync}"
+                f"Sync Status: {sync}\\N"
+                f"Frame ID: {latency['epoch']}:{latency['frame_id']}\\N"
+                f"E2E Display Latency: {latency['latency_ms']:.1f} ms"
             )
             lines.append(
-                ass_dialogue(second, min(second + 1, duration), "Dashboard", text)
+                ass_dialogue(start, end, "Dashboard", text)
             )
 
         for index, stage in enumerate(stages):
@@ -412,7 +532,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         self.ass_file.write_text("".join(lines), encoding="utf-8")
 
     def compose(self):
-        duration = probe_duration(self.raw_recording)
+        duration = self.target_duration()
         escaped_ass = ffmpeg_filter_escape(self.ass_file)
         command = [
             "ffmpeg",
@@ -429,9 +549,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             ]
         else:
             font_file = ffmpeg_filter_escape(Path(FONT))
+            source_trim = max(
+                0.0,
+                (self.recording_start_us - self.source_recording_start_us)
+                / 1_000_000.0,
+            )
             filter_graph = (
                 "[0:v]setpts=PTS-STARTPTS[received];"
-                "[1:v]trim=start=0:"
+                f"[1:v]trim=start={source_trim:.6f}:"
                 f"duration={duration:.3f},setpts=PTS-STARTPTS,"
                 "scale=320:180:force_original_aspect_ratio=decrease,"
                 "pad=320:180:(ow-iw)/2:(oh-ih)/2:black,"
@@ -445,10 +570,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 f"subtitles='{escaped_ass}'[out]"
             )
             command += [
-                "-stream_loop",
-                "-1",
                 "-i",
-                str(self.args.input.resolve()),
+                str(self.source_recording),
                 "-filter_complex",
                 filter_graph,
                 "-map",
@@ -645,6 +768,18 @@ def rolling_loss_average(samples, at, start):
         if start <= sample["at"] <= at
     ]
     return sum(values) / len(values) if values else None
+
+
+def percentile(values, percent):
+    if not values:
+        raise RuntimeError("cannot calculate latency percentile without samples")
+    if len(values) == 1:
+        return values[0]
+    position = (len(values) - 1) * percent / 100.0
+    lower = int(position)
+    upper = min(lower + 1, len(values) - 1)
+    fraction = position - lower
+    return values[lower] * (1.0 - fraction) + values[upper] * fraction
 
 
 def ass_time(seconds):

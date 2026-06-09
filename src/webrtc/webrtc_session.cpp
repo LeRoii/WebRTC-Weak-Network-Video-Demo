@@ -29,6 +29,8 @@ WebRtcSession::WebRtcSession(Role role,
                              std::string video_file,
                              std::string output_file,
                              std::string demo_record_file,
+                             std::string demo_source_record_file,
+                             std::string latency_csv,
                              int max_video_kbps,
                              int recovery_timeout_ms)
     : role_(role),
@@ -46,9 +48,11 @@ WebRtcSession::WebRtcSession(Role role,
     if (role_ == Role::Sender) {
         video_sender_.set_quality_estimator(&estimator_);
         video_sender_.set_video_file(std::move(video_file));
+        video_sender_.set_demo_source_record_file(demo_source_record_file);
     } else {
         video_receiver_.set_quality_estimator(&estimator_);
         video_receiver_.set_recovery_timeout_ms(recovery_timeout_ms);
+        video_receiver_.set_latency_csv(latency_csv);
         video_receiver_.start_display();
         video_receiver_.set_output_file(output_file);
         video_receiver_.set_demo_record_file(demo_record_file);

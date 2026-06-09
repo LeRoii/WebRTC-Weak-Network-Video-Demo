@@ -3,6 +3,7 @@
 #include "common/types.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <rtc/rtc.hpp>
 #include <string>
 
@@ -14,6 +15,7 @@ struct SwsContext;
 struct EncodedVideoFrame {
     rtc::binary data;
     uint32_t duration_90khz = 3000;
+    uint32_t sender_start_us = 0;
     uint16_t epoch = 1;
     bool keyframe = false;
 };
@@ -29,6 +31,7 @@ public:
     bool next_frame(EncodedVideoFrame &frame,
                     const VideoProfile &profile,
                     bool force_keyframe);
+    void on_source_frame(std::function<void(const AVFrame *)> callback);
     void reset();
 
 private:
@@ -56,4 +59,5 @@ private:
     uint16_t epoch_ = 0;
     int64_t encoder_pts_ = 0;
     double next_output_source_seconds_ = -1.0;
+    std::function<void(const AVFrame *)> source_frame_callback_;
 };

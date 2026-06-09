@@ -1,5 +1,7 @@
 #include "video/h264_decoder.hpp"
 
+#include "common/utils.hpp"
+
 #include <cstring>
 #include <stdexcept>
 
@@ -49,7 +51,9 @@ void H264Decoder::reset() {
     open();
 }
 
-bool H264Decoder::decode(const std::byte *data, std::size_t size) {
+bool H264Decoder::decode(const std::byte *data,
+                         std::size_t size,
+                         FrameTiming timing) {
     AVPacket *packet = av_packet_alloc();
     if (!packet) {
         return false;
@@ -73,18 +77,11 @@ bool H264Decoder::decode(const std::byte *data, std::size_t size) {
             (frame_->flags & AV_FRAME_FLAG_CORRUPT) != 0 ||
             frame_->decode_error_flags != 0;
         if (!corrupt) {
-            if (frame_callback_) {
-                frame_callback_(frame_);
-            }
-            renderer_.submit(frame_);
+            timing.decode_complete_us = now_us();
+            renderer_.submit(frame_, timing);
             rendered = true;
         }
         av_frame_unref(frame_);
     }
     return rendered;
-}
-
-void H264Decoder::set_frame_callback(
-    std::function<void(const AVFrame *)> callback) {
-    frame_callback_ = std::move(callback);
 }

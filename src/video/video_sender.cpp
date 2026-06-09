@@ -115,6 +115,14 @@ void VideoSender::update_network_quality(NetworkQuality quality) {
 void VideoSender::set_video_file(std::string path) {
     std::lock_guard<std::mutex> lock(mutex_);
     file_reader_ = std::make_unique<VideoFileReader>(std::move(path));
+    file_reader_->on_source_frame(
+        [this](const AVFrame *frame) { source_recorder_.submit(frame); });
+}
+
+void VideoSender::set_demo_source_record_file(const std::string &path) {
+    if (!path.empty()) {
+        source_recorder_.start(path);
+    }
 }
 
 void VideoSender::start() {
@@ -128,6 +136,7 @@ void VideoSender::stop() {
     if (thread_.joinable()) {
         thread_.join();
     }
+    source_recorder_.stop();
 }
 
 void VideoSender::send_loop() {
@@ -180,7 +189,8 @@ void VideoSender::send_loop() {
             transport = transport_handler_;
         }
         if (transport) {
-            transport->set_outgoing_frame(frame.epoch, frame.keyframe);
+            transport->set_outgoing_frame(
+                frame.epoch, frame.keyframe, frame.sender_start_us);
         }
 
         const std::size_t frame_bytes = frame.data.size();

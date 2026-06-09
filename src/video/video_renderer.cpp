@@ -1,10 +1,13 @@
 #include "video/video_renderer.hpp"
 
+#include "common/utils.hpp"
+
 #include <SDL2/SDL.h>
 
 #include <chrono>
 #include <iostream>
 #include <stdexcept>
+#include <vector>
 
 extern "C" {
 #include <libavutil/frame.h>
@@ -36,22 +39,41 @@ void VideoRenderer::stop() {
     clear_queue();
 }
 
-void VideoRenderer::submit(const AVFrame *frame) {
+void VideoRenderer::submit(const AVFrame *frame, FrameTiming timing) {
     AVFrame *copy = av_frame_clone(frame);
     if (!copy) {
+        if (drop_callback_) {
+            drop_callback_(timing);
+        }
         return;
     }
 
+    std::vector<FrameTiming> dropped;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         while (frames_.size() >= kMaxQueuedFrames) {
-            AVFrame *old = frames_.front();
+            auto old = std::move(frames_.front());
             frames_.pop_front();
-            av_frame_free(&old);
+            dropped.push_back(old.timing);
+            av_frame_free(&old.frame);
         }
-        frames_.push_back(copy);
+        frames_.push_back(QueuedFrame{copy, timing});
+    }
+    for (auto &dropped_timing : dropped) {
+        if (drop_callback_) {
+            drop_callback_(dropped_timing);
+        }
     }
     cv_.notify_one();
+}
+
+void VideoRenderer::on_present(
+    std::function<void(const AVFrame *, FrameTiming)> callback) {
+    present_callback_ = std::move(callback);
+}
+
+void VideoRenderer::on_drop(std::function<void(FrameTiming)> callback) {
+    drop_callback_ = std::move(callback);
 }
 
 void VideoRenderer::render_loop() {
@@ -70,13 +92,13 @@ void VideoRenderer::render_loop() {
     AVPixelFormat source_format = AV_PIX_FMT_NONE;
 
     while (!stopping_.load()) {
-        AVFrame *frame = nullptr;
+        QueuedFrame queued;
         {
             std::unique_lock<std::mutex> lock(mutex_);
             cv_.wait_for(lock, std::chrono::milliseconds(50),
                          [this] { return stopping_.load() || !frames_.empty(); });
             if (!frames_.empty()) {
-                frame = frames_.front();
+                queued = std::move(frames_.front());
                 frames_.pop_front();
             }
         }
@@ -88,9 +110,10 @@ void VideoRenderer::render_loop() {
             }
         }
 
-        if (!frame) {
+        if (!queued.frame) {
             continue;
         }
+        AVFrame *frame = queued.frame;
 
         const auto frame_format = static_cast<AVPixelFormat>(frame->format);
         if (!window || width != frame->width || height != frame->height ||
@@ -105,12 +128,19 @@ void VideoRenderer::render_loop() {
                                           SDL_WINDOW_RESIZABLE);
                 renderer = window ? SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED)
                                   : nullptr;
+                if (window && !renderer) {
+                    renderer =
+                        SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+                }
             } else {
                 SDL_SetWindowSize(window, width, height);
             }
 
             if (!window || !renderer) {
                 std::cerr << "sdl_window_failed=" << SDL_GetError() << std::endl;
+                if (drop_callback_) {
+                    drop_callback_(queued.timing);
+                }
                 av_frame_free(&frame);
                 break;
             }
@@ -145,6 +175,10 @@ void VideoRenderer::render_loop() {
         SDL_RenderClear(renderer);
         SDL_RenderCopy(renderer, texture, nullptr, nullptr);
         SDL_RenderPresent(renderer);
+        queued.timing.present_us = now_us();
+        if (present_callback_) {
+            present_callback_(frame, queued.timing);
+        }
         av_frame_free(&frame);
     }
 
@@ -165,8 +199,11 @@ void VideoRenderer::render_loop() {
 void VideoRenderer::clear_queue() {
     std::lock_guard<std::mutex> lock(mutex_);
     while (!frames_.empty()) {
-        AVFrame *frame = frames_.front();
+        auto queued = std::move(frames_.front());
         frames_.pop_front();
-        av_frame_free(&frame);
+        if (drop_callback_) {
+            drop_callback_(queued.timing);
+        }
+        av_frame_free(&queued.frame);
     }
 }

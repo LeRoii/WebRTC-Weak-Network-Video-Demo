@@ -1,5 +1,7 @@
 #include "video/demo_video_recorder.hpp"
 
+#include "common/utils.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -217,7 +219,8 @@ void DemoVideoRecorder::open_output() {
     next_pts_ = 0;
 
     std::cerr << "demo_recording_started=" << path_
-              << " format=1280x720@30" << std::endl;
+              << " format=1280x720@30"
+              << " start_us=" << now_us() << std::endl;
 }
 
 void DemoVideoRecorder::close_output() {

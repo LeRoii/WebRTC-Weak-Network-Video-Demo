@@ -38,8 +38,14 @@ bool contains_h264_idr(const rtc::binary &frame) {
 }
 
 VideoReceiver::VideoReceiver() : decoder_(renderer_) {
-    decoder_.set_frame_callback(
-        [this](const AVFrame *frame) { demo_recorder_.submit(frame); });
+    renderer_.on_present(
+        [this](const AVFrame *frame, FrameTiming timing) {
+            latency_csv_.record(timing, FrameTerminalStatus::Presented);
+            demo_recorder_.submit(frame);
+        });
+    renderer_.on_drop([this](FrameTiming timing) {
+        latency_csv_.record(timing, FrameTerminalStatus::RendererDropped);
+    });
 }
 
 VideoReceiver::~VideoReceiver() {
@@ -49,6 +55,7 @@ VideoReceiver::~VideoReceiver() {
     }
     demo_recorder_.stop();
     renderer_.stop();
+    latency_csv_.close();
 }
 
 void VideoReceiver::start_display() {
@@ -66,6 +73,12 @@ void VideoReceiver::set_output_file(const std::string &path) {
 void VideoReceiver::set_demo_record_file(const std::string &path) {
     if (!path.empty()) {
         demo_recorder_.start(path);
+    }
+}
+
+void VideoReceiver::set_latency_csv(const std::string &path) {
+    if (!path.empty()) {
+        latency_csv_.open(path);
     }
 }
 
@@ -94,6 +107,9 @@ void VideoReceiver::attach_track(std::shared_ptr<rtc::Track> track) {
     transport_handler->on_sync_restored([this]() {
         reset_decoder_.store(true);
     });
+    transport_handler->on_frame_dropped([this](FrameTiming timing) {
+        latency_csv_.record(timing, FrameTerminalStatus::NetworkDropped);
+    });
 
     depacketizer->addToChain(transport_handler);
     if (stats_handler) {
@@ -118,13 +134,23 @@ void VideoReceiver::attach_track(std::shared_ptr<rtc::Track> track) {
         std::cerr << "video_track_closed=1" << std::endl;
         track_open_.store(false);
     });
-    track->onFrame([this](rtc::binary frame, rtc::FrameInfo) {
+    track->onFrame([this](rtc::binary frame, rtc::FrameInfo info) {
         const bool keyframe = contains_h264_idr(frame);
+        auto timing = transport_handler_
+                          ? transport_handler_->take_completed_frame(info.timestamp)
+                          : std::nullopt;
+        if (!timing) {
+            std::cerr << "frame_timing_missing rtp_timestamp="
+                      << info.timestamp << std::endl;
+            timing = FrameTiming{};
+            timing->rtp_timestamp = info.timestamp;
+        }
         if (reset_decoder_.exchange(false)) {
             decoder_.reset();
         }
-        if (!decoder_.decode(frame.data(), frame.size())) {
+        if (!decoder_.decode(frame.data(), frame.size(), *timing)) {
             stats_.on_decoder_error();
+            latency_csv_.record(*timing, FrameTerminalStatus::DecoderError);
             if (transport_handler_) {
                 transport_handler_->invalidate_sync();
             }

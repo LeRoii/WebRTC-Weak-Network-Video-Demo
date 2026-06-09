@@ -2,6 +2,7 @@
 
 #include "common/types.hpp"
 #include "quality/network_quality_estimator.hpp"
+#include "video/demo_video_recorder.hpp"
 #include "video/video_file_reader.hpp"
 #include "video/video_transport_handler.hpp"
 
@@ -21,6 +22,7 @@ public:
     void set_quality_estimator(NetworkQualityEstimator *estimator);
     void set_track(std::shared_ptr<rtc::Track> track);
     void set_video_file(std::string path);
+    void set_demo_source_record_file(const std::string &path);
     void update_profile(VideoProfile profile);
     void update_network_quality(NetworkQuality quality);
     void start();
@@ -41,6 +43,7 @@ private:
     std::shared_ptr<rtc::PacingHandler> pacing_handler_;
     NetworkQualityEstimator *estimator_ = nullptr;
     std::unique_ptr<VideoFileReader> file_reader_;
+    DemoVideoRecorder source_recorder_;
     VideoProfile profile_;
     NetworkQuality quality_;
     std::atomic<bool> stopping_{false};

@@ -89,6 +89,9 @@ Optional controls:
 ```text
 --max-video-kbps <150-2000>       maximum encoded media target, default 2000
 --recovery-timeout-ms <100-1000>  incomplete-frame recovery window, default 1000
+--demo-record-file <path>          receiver display recording for demos
+--demo-source-record-file <path>   selected sender source recording for demos
+--latency-csv <path>               per-frame end-to-end display latency
 ```
 
 The adaptation ladder is:
@@ -139,12 +142,14 @@ sudo ip netns exec webrtc_tx ./build/webrtc_net_quality_probe \
 ```
 
 After SDP/ICE completes and the sender starts printing quality logs, apply
-one-way media loss:
+two-way network impairment. This matches Clumsy with both `Inbound` and
+`Outbound` checked:
 
 ```bash
 sudo ./scripts/netem_loss.sh ns-loss 10
 sudo ./scripts/netem_loss.sh ns-loss 40
 sudo ./scripts/netem_loss.sh ns-loss 80
+sudo ./scripts/netem_loss.sh ns-loss 80 50 both
 sudo ./scripts/netem_loss.sh ns-show
 ```
 
@@ -161,8 +166,11 @@ The namespace topology is:
 webrtc_tx/veth_tx 10.88.0.1/24  <---->  webrtc_rx/veth_rx 10.88.0.2/24
 ```
 
-`ns-loss` defaults to applying loss only on `webrtc_tx/veth_tx`, so it simulates
-one-way media loss from sender to receiver.
+`ns-loss` defaults to `both`, applying the configured loss and delay to traffic
+leaving both namespaces. For example, `ns-loss 80 50` matches Clumsy's
+`Drop 80%` and `Lag 50 ms` with both directions checked. The 50 ms delay is
+applied once in each direction, so RTT increases by approximately 100 ms.
+Pass `tx` or `rx` as the final argument for an explicit one-way test.
 
 Validate that the received elementary stream contains no corrupt decoded
 frames:
@@ -195,12 +203,26 @@ to start, and runs this sequence:
 0% loss for 20 seconds (network recovery)
 ```
 
-It combines the real receiver recording, the source preview, and timestamped
-runtime metrics into:
+It combines the real receiver recording, a monotonic-clock-aligned recording
+of the source frames actually selected by the sender, and timestamped runtime
+metrics into:
 
 ```text
 demo/output/weak_network_demo_720p30.mp4
 ```
+
+The dashboard includes the current frame ID and end-to-end display latency,
+measured from the sender selecting the source frame through the receiver's
+`SDL_RenderPresent` call. The script also writes:
+
+```text
+demo/output/weak_network_demo_720p30_latency.csv
+demo/output/weak_network_demo_720p30_latency_summary.json
+```
+
+The summary reports P50, P95, and maximum latency. This direct one-way
+measurement is valid for the included same-host network-namespace workflow,
+where both processes share the Linux monotonic clock.
 
 Omit the source preview while keeping the receiver video and dashboard:
 

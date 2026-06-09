@@ -22,6 +22,8 @@ public:
                   std::string video_file,
                   std::string output_file,
                   std::string demo_record_file,
+                  std::string demo_source_record_file,
+                  std::string latency_csv,
                   int max_video_kbps,
                   int recovery_timeout_ms);
     ~WebRtcSession();

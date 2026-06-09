@@ -25,6 +25,7 @@ add_executable(webrtc_net_quality_probe
     src/quality/video_adaptation.cpp
     src/signaling/udp_signaling.cpp
     src/video/demo_video_recorder.cpp
+    src/video/frame_timing.cpp
     src/video/video_file_reader.cpp
     src/video/h264_decoder.cpp
     src/video/video_receiver.cpp

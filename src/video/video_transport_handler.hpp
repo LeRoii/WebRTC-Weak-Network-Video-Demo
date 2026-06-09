@@ -1,5 +1,7 @@
 #pragma once
 
+#include "video/frame_timing.hpp"
+
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -56,15 +58,20 @@ public:
                   const rtc::message_callback &send) override;
 
     void set_outgoing_frame(uint16_t epoch, bool keyframe);
+    void set_outgoing_frame(uint16_t epoch,
+                            bool keyframe,
+                            uint32_t sender_start_us);
     void poll();
     void invalidate_sync();
     void record_pli_sent();
     bool needs_keyframe() const;
     VideoTransportStats snapshot() const;
+    std::optional<FrameTiming> take_completed_frame(uint32_t rtp_timestamp);
 
     void on_keyframe_requested(std::function<void()> callback);
     void on_keyframe_acknowledged(std::function<void()> callback);
     void on_sync_restored(std::function<void()> callback);
+    void on_frame_dropped(std::function<void(FrameTiming)> callback);
 
 private:
     struct FrameMetadata {
@@ -73,6 +80,7 @@ private:
         uint16_t packet_index = 0;
         uint16_t packet_count = 0;
         bool keyframe = false;
+        uint32_t sender_start_us = 0;
     };
 
     struct FrameAssembly {
@@ -80,6 +88,8 @@ private:
         uint32_t frame_id = 0;
         uint16_t packet_count = 0;
         uint16_t first_sequence = 0;
+        uint32_t rtp_timestamp = 0;
+        uint32_t sender_start_us = 0;
         bool keyframe = false;
         bool marker_seen = false;
         int64_t first_seen_us = 0;
@@ -110,6 +120,8 @@ private:
                            uint32_t frame_id,
                            const rtc::message_callback &send);
     void mark_unsynchronized();
+    void record_network_drop(const FrameAssembly &frame);
+    void store_completed_timing(const FrameAssembly &frame);
 
     Direction direction_;
     const int64_t recovery_timeout_us_;
@@ -117,15 +129,18 @@ private:
     mutable std::mutex mutex_;
     uint16_t epoch_ = 1;
     bool next_frame_keyframe_ = false;
+    uint32_t next_frame_sender_start_us_ = 0;
     uint32_t next_frame_id_ = 1;
     std::optional<uint16_t> receiver_epoch_;
     std::optional<uint32_t> next_output_frame_id_;
     std::map<uint32_t, FrameAssembly> frames_;
+    std::map<uint32_t, FrameTiming> completed_timings_;
     rtc::message_callback receiver_send_;
 
     std::function<void()> keyframe_requested_callback_;
     std::function<void()> keyframe_acknowledged_callback_;
     std::function<void()> sync_restored_callback_;
+    std::function<void(FrameTiming)> frame_dropped_callback_;
 
     VideoTransportStats stats_;
 };

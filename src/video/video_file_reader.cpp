@@ -1,5 +1,7 @@
 #include "video/video_file_reader.hpp"
 
+#include "common/utils.hpp"
+
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
@@ -73,6 +75,10 @@ bool VideoFileReader::next_frame(EncodedVideoFrame &frame,
 
         check_ffmpeg(av_frame_make_writable(scaled_frame_),
                      "av_frame_make_writable");
+        frame.sender_start_us = static_cast<uint32_t>(now_us());
+        if (source_frame_callback_) {
+            source_frame_callback_(decoded_frame_);
+        }
         sws_scale(sws_context_,
                   decoded_frame_->data,
                   decoded_frame_->linesize,
@@ -117,6 +123,11 @@ bool VideoFileReader::next_frame(EncodedVideoFrame &frame,
         return true;
     }
     return false;
+}
+
+void VideoFileReader::on_source_frame(
+    std::function<void(const AVFrame *)> callback) {
+    source_frame_callback_ = std::move(callback);
 }
 
 void VideoFileReader::reset() {

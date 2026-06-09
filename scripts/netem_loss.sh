@@ -26,6 +26,7 @@ Usage:
 Examples:
   sudo ./scripts/netem_loss.sh ns-up
   sudo ./scripts/netem_loss.sh ns-loss 15
+  sudo ./scripts/netem_loss.sh ns-loss 80 50 both
   sudo ./scripts/netem_loss.sh ns-show
   sudo ./scripts/netem_loss.sh ns-clear
   sudo ./scripts/netem_loss.sh ns-down
@@ -38,8 +39,9 @@ Default topology:
   webrtc_tx/veth_tx 10.88.0.1/24  <---->  webrtc_rx/veth_rx 10.88.0.2/24
 
 Notes:
-  - ns-loss defaults to tx, so loss is applied only from webrtc_tx to webrtc_rx.
-  - This avoids loopback's possible two-direction loss amplification.
+  - ns-loss defaults to both, matching Clumsy with Inbound and Outbound checked.
+  - A 50 ms delay on both directions adds about 100 ms to RTT.
+  - Pass tx or rx explicitly when a one-way impairment is required.
   - The current single-process local WebRTC demo does not cross veth. To test
     this topology, run sender and receiver as separate processes in different
     namespaces.
@@ -152,7 +154,7 @@ set_namespace_loss() {
 
     local loss="${1:-}"
     local delay_ms="${2:-0}"
-    local direction="${3:-tx}"
+    local direction="${3:-both}"
 
     if [[ -z "${loss}" ]]; then
         usage
@@ -185,7 +187,7 @@ clear_namespace_loss() {
     require_ns "${DEFAULT_LEFT_NS}"
     require_ns "${DEFAULT_RIGHT_NS}"
 
-    local direction="${1:-tx}"
+    local direction="${1:-both}"
 
     case "${direction}" in
         tx)
@@ -281,11 +283,11 @@ case "${cmd}" in
         ;;
 
     ns-loss)
-        set_namespace_loss "${2:-}" "${3:-0}" "${4:-tx}"
+        set_namespace_loss "${2:-}" "${3:-0}" "${4:-both}"
         ;;
 
     ns-clear)
-        clear_namespace_loss "${2:-tx}"
+        clear_namespace_loss "${2:-both}"
         ;;
 
     ns-show)

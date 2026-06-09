@@ -2,6 +2,7 @@
 
 #include "quality/network_quality_estimator.hpp"
 #include "video/demo_video_recorder.hpp"
+#include "video/frame_timing.hpp"
 #include "video/h264_decoder.hpp"
 #include "video/video_renderer.hpp"
 #include "video/video_stats.hpp"
@@ -24,6 +25,7 @@ public:
     void start_display();
     void set_output_file(const std::string &path);
     void set_demo_record_file(const std::string &path);
+    void set_latency_csv(const std::string &path);
     void set_quality_estimator(NetworkQualityEstimator *estimator);
     void set_recovery_timeout_ms(int timeout_ms);
     void attach_track(std::shared_ptr<rtc::Track> track);
@@ -49,5 +51,6 @@ private:
     std::thread recovery_thread_;
     VideoRenderer renderer_;
     DemoVideoRecorder demo_recorder_;
+    FrameLatencyCsv latency_csv_;
     H264Decoder decoder_;
 };

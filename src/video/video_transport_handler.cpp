@@ -12,7 +12,7 @@
 namespace {
 constexpr uint8_t kFrameInfoExtMapId = 4;
 constexpr uint16_t kOneByteExtensionProfile = 0xbede;
-constexpr std::size_t kFrameMetadataSize = 12;
+constexpr std::size_t kFrameMetadataSize = 16;
 constexpr int64_t kNackDelayUs = 120'000;
 constexpr int64_t kNackRetryUs = 50'000;
 constexpr std::size_t kMaxBufferedFrames = 64;
@@ -154,9 +154,17 @@ void VideoTransportHandler::outgoing(rtc::message_vector &messages,
 
 void VideoTransportHandler::set_outgoing_frame(uint16_t epoch,
                                                bool keyframe) {
+    set_outgoing_frame(epoch, keyframe, 0);
+}
+
+void VideoTransportHandler::set_outgoing_frame(
+    uint16_t epoch,
+    bool keyframe,
+    uint32_t sender_start_us) {
     std::lock_guard<std::mutex> lock(mutex_);
     epoch_ = std::max<uint16_t>(1, epoch);
     next_frame_keyframe_ = keyframe;
+    next_frame_sender_start_us_ = sender_start_us;
 }
 
 void VideoTransportHandler::poll() {
@@ -173,6 +181,9 @@ void VideoTransportHandler::poll() {
 void VideoTransportHandler::invalidate_sync() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (direction_ == Direction::Receiver) {
+        for (const auto &entry : frames_) {
+            record_network_drop(entry.second);
+        }
         frames_.clear();
         next_output_frame_id_.reset();
         mark_unsynchronized();
@@ -196,6 +207,18 @@ VideoTransportStats VideoTransportHandler::snapshot() const {
     return stats_;
 }
 
+std::optional<FrameTiming>
+VideoTransportHandler::take_completed_frame(uint32_t rtp_timestamp) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = completed_timings_.find(rtp_timestamp);
+    if (it == completed_timings_.end()) {
+        return std::nullopt;
+    }
+    FrameTiming timing = it->second;
+    completed_timings_.erase(it);
+    return timing;
+}
+
 void VideoTransportHandler::on_keyframe_requested(
     std::function<void()> callback) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -211,6 +234,12 @@ void VideoTransportHandler::on_keyframe_acknowledged(
 void VideoTransportHandler::on_sync_restored(std::function<void()> callback) {
     std::lock_guard<std::mutex> lock(mutex_);
     sync_restored_callback_ = std::move(callback);
+}
+
+void VideoTransportHandler::on_frame_dropped(
+    std::function<void(FrameTiming)> callback) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    frame_dropped_callback_ = std::move(callback);
 }
 
 void VideoTransportHandler::sender_outgoing(rtc::message_vector &messages) {
@@ -235,7 +264,9 @@ void VideoTransportHandler::sender_outgoing(rtc::message_vector &messages) {
     for (uint16_t index = 0; index < packet_count; ++index) {
         const auto &message = media_packets[index];
         add_frame_metadata(
-            message, FrameMetadata{epoch_, frame_id, index, packet_count, keyframe});
+            message,
+            FrameMetadata{epoch_, frame_id, index, packet_count, keyframe,
+                          next_frame_sender_start_us_});
     }
 }
 
@@ -333,6 +364,9 @@ void VideoTransportHandler::process_receiver_packet(
     }
 
     if (!receiver_epoch_ || *receiver_epoch_ != metadata->epoch) {
+        for (const auto &entry : frames_) {
+            record_network_drop(entry.second);
+        }
         frames_.clear();
         receiver_epoch_ = metadata->epoch;
         next_output_frame_id_ = metadata->frame_id;
@@ -362,10 +396,12 @@ void VideoTransportHandler::process_receiver_packet(
         frame.frame_id = metadata->frame_id;
         frame.packet_count = metadata->packet_count;
         frame.keyframe = metadata->keyframe;
+        frame.sender_start_us = metadata->sender_start_us;
         frame.first_seen_us = now_us();
         frame.packets.resize(metadata->packet_count);
         const auto *header =
             reinterpret_cast<const rtc::RtpHeader *>(message->data());
+        frame.rtp_timestamp = header->timestamp();
         frame.first_sequence = static_cast<uint16_t>(
             header->seqNumber() - metadata->packet_index);
     }
@@ -373,6 +409,7 @@ void VideoTransportHandler::process_receiver_packet(
     if (frame.packet_count != metadata->packet_count ||
         frame.epoch != metadata->epoch ||
         frame.keyframe != metadata->keyframe) {
+        record_network_drop(frame);
         mark_unsynchronized();
         frames_.erase(metadata->frame_id);
         return;
@@ -386,6 +423,7 @@ void VideoTransportHandler::process_receiver_packet(
     frame.marker_seen = frame.marker_seen || header->marker();
 
     while (frames_.size() > kMaxBufferedFrames) {
+        record_network_drop(frames_.begin()->second);
         frames_.erase(frames_.begin());
         mark_unsynchronized();
     }
@@ -408,8 +446,12 @@ void VideoTransportHandler::drain_complete_frames(
                 }
                 ++stats_.complete_frames;
                 stats_.synchronized = true;
+                store_completed_timing(frame);
                 next_output_frame_id_ = frame.frame_id + 1;
                 send_keyframe_ack(frame.epoch, frame.frame_id, send);
+                for (auto dropped = frames_.begin(); dropped != it; ++dropped) {
+                    record_network_drop(dropped->second);
+                }
                 frames_.erase(frames_.begin(), std::next(it));
                 break;
             }
@@ -417,6 +459,7 @@ void VideoTransportHandler::drain_complete_frames(
             if (frame.complete() ||
                 at_us - frame.first_seen_us >= recovery_timeout_us_) {
                 ++stats_.dropped_frames;
+                record_network_drop(frame);
                 it = frames_.erase(it);
             } else {
                 ++it;
@@ -432,6 +475,7 @@ void VideoTransportHandler::drain_complete_frames(
         }
         auto &frame = it->second;
         if (frame.complete()) {
+            store_completed_timing(frame);
             for (auto &packet : frame.packets) {
                 ready.push_back(std::move(packet));
             }
@@ -443,6 +487,7 @@ void VideoTransportHandler::drain_complete_frames(
 
         if (at_us - frame.first_seen_us >= recovery_timeout_us_) {
             ++stats_.dropped_frames;
+            record_network_drop(frame);
             ++*next_output_frame_id_;
             frames_.erase(it);
             mark_unsynchronized();
@@ -545,6 +590,37 @@ void VideoTransportHandler::mark_unsynchronized() {
     stats_.synchronized = false;
 }
 
+void VideoTransportHandler::record_network_drop(
+    const FrameAssembly &frame) {
+    if (!frame_dropped_callback_) {
+        return;
+    }
+    FrameTiming timing;
+    timing.epoch = frame.epoch;
+    timing.frame_id = frame.frame_id;
+    timing.rtp_timestamp = frame.rtp_timestamp;
+    timing.sender_start_us = frame.sender_start_us;
+    timing.first_packet_us = frame.first_seen_us;
+    timing.synchronized = false;
+    frame_dropped_callback_(timing);
+}
+
+void VideoTransportHandler::store_completed_timing(
+    const FrameAssembly &frame) {
+    FrameTiming timing;
+    timing.epoch = frame.epoch;
+    timing.frame_id = frame.frame_id;
+    timing.rtp_timestamp = frame.rtp_timestamp;
+    timing.sender_start_us = frame.sender_start_us;
+    timing.first_packet_us = frame.first_seen_us;
+    timing.frame_complete_us = now_us();
+    timing.synchronized = stats_.synchronized;
+    completed_timings_[timing.rtp_timestamp] = timing;
+    while (completed_timings_.size() > kMaxBufferedFrames) {
+        completed_timings_.erase(completed_timings_.begin());
+    }
+}
+
 void VideoTransportHandler::add_frame_metadata(
     const rtc::message_ptr &message,
     const FrameMetadata &metadata) {
@@ -612,7 +688,7 @@ void VideoTransportHandler::add_frame_metadata(
     append_u32(value, metadata.frame_id);
     append_u16(value, metadata.packet_index);
     append_u16(value, metadata.packet_count);
-    value.push_back(std::byte{0});
+    append_u32(value, metadata.sender_start_us);
 
     extension_body.push_back(static_cast<std::byte>(
         (kFrameInfoExtMapId << 4U) | (kFrameMetadataSize - 1U)));
@@ -694,6 +770,7 @@ VideoTransportHandler::read_frame_metadata(
             metadata.frame_id = read_u32(value + 3);
             metadata.packet_index = read_u16(value + 7);
             metadata.packet_count = read_u16(value + 9);
+            metadata.sender_start_us = read_u32(value + 11);
             return metadata;
         }
         offset += 1U + value_size;
